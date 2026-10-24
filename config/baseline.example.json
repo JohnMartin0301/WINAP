@@ -1,0 +1,30 @@
+{
+  "schemaVersion": "1.0",
+  "mode": "Audit",
+  "baseline": {
+    "smb1ServerEnabled": false,
+    "firewallProfiles": {
+      "Domain": true,
+      "Private": true,
+      "Public": true
+    },
+    "tlsProtocols": {
+      "TLS 1.0": "AuditOnly",
+      "TLS 1.1": "AuditOnly",
+      "TLS 1.2": "AuditOnly"
+    }
+  },
+  "features": {
+    "enabled": false,
+    "requested": []
+  },
+  "remediation": {
+    "enabled": false,
+    "target": "SMB1Server"
+  },
+  "reporting": {
+    "outputDirectory": "output",
+    "htmlReport": "WINAP-Report.html",
+    "logFile": "WINAP-Execution.log"
+  }
+}

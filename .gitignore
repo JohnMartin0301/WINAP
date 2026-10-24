@@ -1,0 +1,44 @@
+# Runtime output
+output/
+logs/
+reports/generated/
+*.log
+*.tmp
+*.temp
+
+# Local secrets and credentials
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.pem
+*.key
+secrets/
+credentials/
+
+# PowerShell/test output
+TestResults/
+coverage/
+PesterResults.xml
+
+# Editors and OS files
+.vscode/
+.vs/
+*.user
+*.suo
+.DS_Store
+Thumbs.db
+
+# VMware and VM artifacts
+*.vmdk
+*.vmsd
+*.vmsn
+*.vmem
+*.vmsw
+*.vmxf
+*.nvram
+*.vmss
+*.ova
+*.ovf
+*.iso
