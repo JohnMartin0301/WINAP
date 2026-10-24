@@ -45,7 +45,7 @@ try {
     Assert-Throws 'Rejects remediation targets other than SMB1Server' { Import-WINAPConfiguration -Path $temp }
 
     $invalid = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
-    $invalid.extraDangerousSetting = $true
+    $invalid | Add-Member -MemberType NoteProperty -Name 'extraDangerousSetting' -Value $true
     $invalid | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $temp -Encoding UTF8
     Assert-Throws 'Rejects unknown top-level configuration keys' { Import-WINAPConfiguration -Path $temp }
 } finally {

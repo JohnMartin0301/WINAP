@@ -123,24 +123,46 @@ function Import-WINAPConfiguration {
     return $cfg
 }
 
+
 function Get-WINAPInventory {
     [CmdletBinding()]
     param([Parameter(Mandatory)][object]$Environment)
+
     $computer = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue
     $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
     $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction SilentlyContinue
+
+    # Safely collect the last boot time.
+    $lastBootTime = 'Unknown'
+
+    if ($os -and $null -ne $os.LastBootUpTime) {
+        try {
+            if ($os.LastBootUpTime -is [datetime]) {
+                $lastBootTime = $os.LastBootUpTime.ToString('yyyy-MM-dd HH:mm:ss')
+            }
+            else {
+                $lastBootTime = [Management.ManagementDateTimeConverter]::ToDateTime(
+                    [string]$os.LastBootUpTime
+                ).ToString('yyyy-MM-dd HH:mm:ss')
+            }
+        }
+        catch {
+            $lastBootTime = 'Unknown'
+        }
+    }
+
     [PSCustomObject]@{
-        ComputerName = $env:COMPUTERNAME
-        Domain = if ($computer) { [string]$computer.Domain } else { 'Unknown' }
-        Manufacturer = if ($computer) { [string]$computer.Manufacturer } else { 'Unknown' }
-        Model = if ($computer) { [string]$computer.Model } else { 'Unknown' }
-        OperatingSystem = $Environment.OperatingSystem
-        OSVersion = $Environment.Version
-        OSBuild = $Environment.BuildNumber
+        ComputerName      = $env:COMPUTERNAME
+        Domain            = if ($computer) { [string]$computer.Domain } else { 'Unknown' }
+        Manufacturer      = if ($computer) { [string]$computer.Manufacturer } else { 'Unknown' }
+        Model             = if ($computer) { [string]$computer.Model } else { 'Unknown' }
+        OperatingSystem   = $Environment.OperatingSystem
+        OSVersion         = $Environment.Version
+        OSBuild           = $Environment.BuildNumber
         PowerShellVersion = $Environment.PowerShellVersion
-        LastBootTime = if ($os) { [Management.ManagementDateTimeConverter]::ToDateTime($os.LastBootUpTime).ToString('yyyy-MM-dd HH:mm:ss') } else { 'Unknown' }
-        CDriveFreeGB = if ($disk) { [math]::Round($disk.FreeSpace / 1GB, 2) } else { $null }
-        IsAdministrator = $Environment.IsAdministrator
+        LastBootTime      = $lastBootTime
+        CDriveFreeGB      = if ($disk) { [math]::Round($disk.FreeSpace / 1GB, 2) } else { $null }
+        IsAdministrator   = $Environment.IsAdministrator
     }
 }
 
