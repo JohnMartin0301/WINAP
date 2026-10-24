@@ -27,6 +27,37 @@ Assert-True 'Feature installation is disabled by default' (-not $cfg.features.en
 Assert-True 'Remediation is disabled by default' (-not $cfg.remediation.enabled)
 Assert-True 'Hostname changes are not a configuration option' ($null -eq $cfg.PSObject.Properties['changeHostname'])
 
+
+# Phase 3: baseline audit structure and honest state reporting.
+$auditResults = @(Invoke-WINAPAudit -Configuration $cfg)
+$expectedAuditChecks = @(
+    'SMBv1 server protocol',
+    'Domain profile',
+    'Private profile',
+    'Public profile',
+    'TLS 1.0 server protocol indicator',
+    'TLS 1.1 server protocol indicator',
+    'TLS 1.2 server protocol indicator'
+)
+foreach ($checkName in $expectedAuditChecks) {
+    $found = @($auditResults | Where-Object { $_.Check -eq $checkName }).Count -eq 1
+    Assert-True "Audit includes exactly one '$checkName' result" $found
+}
+
+$validStatuses = @('PASS','FAIL','WARN','UNKNOWN','SKIPPED','INFO')
+$statusesValid = @($auditResults | Where-Object { $_.Status -notin $validStatuses }).Count -eq 0
+Assert-True 'Audit results use supported status values' $statusesValid
+
+$tlsAuditOnlyResults = @($auditResults | Where-Object { $_.Category -eq 'TLS' })
+$tlsAuditOnlyStatusesValid = ($tlsAuditOnlyResults.Count -eq 3) -and (@($tlsAuditOnlyResults | Where-Object { $_.Status -notin @('INFO','UNKNOWN') }).Count -eq 0)
+Assert-True 'AuditOnly TLS indicators are observational and never claim baseline PASS/FAIL' $tlsAuditOnlyStatusesValid
+
+$unknownsHonest = @($auditResults | Where-Object {
+    ($_.Category -eq 'SMB' -or $_.Category -eq 'Firewall' -or $_.Category -eq 'TLS') -and
+    $_.Status -eq 'UNKNOWN' -and [string]::IsNullOrWhiteSpace([string]$_.Actual)
+}).Count -eq 0
+Assert-True 'Unknown audit results include an explanatory actual-state label' $unknownsHonest
+
 $temp = Join-Path $env:TEMP ('WINAP-invalid-' + [guid]::NewGuid().ToString('N') + '.json')
 try {
     $invalid = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json

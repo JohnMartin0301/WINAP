@@ -123,7 +123,6 @@ function Import-WINAPConfiguration {
     return $cfg
 }
 
-
 function Get-WINAPInventory {
     [CmdletBinding()]
     param([Parameter(Mandatory)][object]$Environment)
@@ -132,9 +131,8 @@ function Get-WINAPInventory {
     $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
     $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction SilentlyContinue
 
-    # Safely collect the last boot time.
+    # Safely collect the last boot time; CIM providers may return DateTime or DMTF text.
     $lastBootTime = 'Unknown'
-
     if ($os -and $null -ne $os.LastBootUpTime) {
         try {
             if ($os.LastBootUpTime -is [datetime]) {
@@ -169,69 +167,148 @@ function Get-WINAPInventory {
 function Invoke-WINAPAudit {
     [CmdletBinding()]
     param([Parameter(Mandatory)][object]$Configuration)
+
     $results = New-Object System.Collections.Generic.List[object]
 
-    # SMBv1 server protocol: only read the server-side setting.
+    # SMBv1 server protocol: read the server-side setting only. Never infer
+    # a Boolean value from a missing, null, or unexpected property.
+    $smbExpected = [string]$Configuration.baseline.smb1ServerEnabled
     try {
         $smbCmd = Get-Command Get-SmbServerConfiguration -ErrorAction SilentlyContinue
         if (-not $smbCmd) {
-            $results.Add((New-WINAPResult -Category 'SMB' -Check 'SMBv1 server protocol' -Status 'UNKNOWN' -Expected ([string]$Configuration.baseline.smb1ServerEnabled) -Actual 'Unavailable' -Message 'Get-SmbServerConfiguration is unavailable; state could not be verified.'))
-        } else {
-            $smb = Get-SmbServerConfiguration -ErrorAction Stop
-            $actual = [bool]$smb.EnableSMB1Protocol
-            $status = if ($actual -eq [bool]$Configuration.baseline.smb1ServerEnabled) { 'PASS' } else { 'FAIL' }
-            $results.Add((New-WINAPResult -Category 'SMB' -Check 'SMBv1 server protocol' -Status $status -Expected ([string]$Configuration.baseline.smb1ServerEnabled) -Actual ([string]$actual) -Message 'Read the SMB server protocol setting. No change was made.'))
+            $results.Add((New-WINAPResult -Category 'SMB' -Check 'SMBv1 server protocol' -Status 'UNKNOWN' -Expected $smbExpected -Actual 'Unavailable' -Message 'Get-SmbServerConfiguration is unavailable; state could not be verified.'))
         }
-    } catch { $results.Add((New-WINAPResult -Category 'SMB' -Check 'SMBv1 server protocol' -Status 'UNKNOWN' -Expected ([string]$Configuration.baseline.smb1ServerEnabled) -Actual 'Read error' -Message $_.Exception.Message)) }
+        else {
+            $smb = Get-SmbServerConfiguration -ErrorAction Stop
+            $smbProperty = if ($null -ne $smb) { $smb.PSObject.Properties['EnableSMB1Protocol'] } else { $null }
+            if ($null -eq $smbProperty -or $smbProperty.Value -isnot [bool]) {
+                $results.Add((New-WINAPResult -Category 'SMB' -Check 'SMBv1 server protocol' -Status 'UNKNOWN' -Expected $smbExpected -Actual 'Ambiguous or unavailable' -Message 'The SMBv1 server state was missing or was not a readable Boolean. No conclusion was inferred.'))
+            }
+            else {
+                $actual = [bool]$smbProperty.Value
+                $status = if ($actual -eq [bool]$Configuration.baseline.smb1ServerEnabled) { 'PASS' } else { 'FAIL' }
+                $results.Add((New-WINAPResult -Category 'SMB' -Check 'SMBv1 server protocol' -Status $status -Expected $smbExpected -Actual ([string]$actual) -Message 'Read the SMB server protocol setting. No change was made.'))
+            }
+        }
+    }
+    catch {
+        $results.Add((New-WINAPResult -Category 'SMB' -Check 'SMBv1 server protocol' -Status 'UNKNOWN' -Expected $smbExpected -Actual 'Read error' -Message $_.Exception.Message))
+    }
 
-    # Firewall is audit-only.
+    # Firewall profiles are audit-only. Report each requested profile even
+    # when the command or an individual profile state is unavailable.
+    $profiles = $null
+    $firewallReadError = $null
     try {
         $fwCmd = Get-Command Get-NetFirewallProfile -ErrorAction SilentlyContinue
         if (-not $fwCmd) {
-            $results.Add((New-WINAPResult -Category 'Firewall' -Check 'Windows Firewall profiles' -Status 'UNKNOWN' -Expected 'Configured profile states' -Actual 'Unavailable' -Message 'Get-NetFirewallProfile is unavailable.'))
-        } else {
-            $profiles = @(Get-NetFirewallProfile -ErrorAction Stop)
-            foreach ($profileName in @('Domain','Private','Public')) {
-                $p = $profiles | Where-Object { $_.Name -eq $profileName } | Select-Object -First 1
-                if ($null -eq $p) {
-                    $results.Add((New-WINAPResult -Category 'Firewall' -Check "$profileName profile" -Status 'UNKNOWN' -Expected ([string]$Configuration.baseline.firewallProfiles.$profileName) -Actual 'Unavailable' -Message 'Profile was not returned by Get-NetFirewallProfile.'))
-                } else {
-                    $actual = [bool]$p.Enabled
-                    $expected = [bool]$Configuration.baseline.firewallProfiles.$profileName
-                    $status = if ($actual -eq $expected) { 'PASS' } else { 'FAIL' }
-                    $results.Add((New-WINAPResult -Category 'Firewall' -Check "$profileName profile" -Status $status -Expected ([string]$expected) -Actual ([string]$actual) -Message 'Read firewall profile state. WINAP does not modify firewall settings.'))
-                }
-            }
+            $firewallReadError = 'Get-NetFirewallProfile is unavailable.'
         }
-    } catch { $results.Add((New-WINAPResult -Category 'Firewall' -Check 'Windows Firewall profiles' -Status 'UNKNOWN' -Expected 'Configured profile states' -Actual 'Read error' -Message $_.Exception.Message)) }
+        else {
+            $profiles = @(Get-NetFirewallProfile -ErrorAction Stop)
+        }
+    }
+    catch {
+        $firewallReadError = $_.Exception.Message
+    }
 
-    # TLS registry indicators are read-only. Missing values remain UNKNOWN.
+    foreach ($profileName in @('Domain','Private','Public')) {
+        $expected = [bool]$Configuration.baseline.firewallProfiles.$profileName
+        if ($null -ne $firewallReadError) {
+            $results.Add((New-WINAPResult -Category 'Firewall' -Check "$profileName profile" -Status 'UNKNOWN' -Expected ([string]$expected) -Actual 'Read error or unavailable' -Message $firewallReadError))
+            continue
+        }
+
+        $matches = @($profiles | Where-Object { $_.Name -eq $profileName })
+        if ($matches.Count -ne 1) {
+            $results.Add((New-WINAPResult -Category 'Firewall' -Check "$profileName profile" -Status 'UNKNOWN' -Expected ([string]$expected) -Actual 'Missing or duplicate profile' -Message 'Exactly one profile was not returned by Get-NetFirewallProfile.'))
+            continue
+        }
+
+                $enabledProperty = $matches[0].PSObject.Properties['Enabled']
+
+        if ($null -eq $enabledProperty -or $null -eq $enabledProperty.Value) {
+            $results.Add((New-WINAPResult -Category 'Firewall' -Check "$profileName profile" -Status 'UNKNOWN' -Expected ([string]$expected) -Actual 'Ambiguous or unavailable' -Message 'The profile Enabled state was missing or null. No conclusion was inferred.'))
+            continue
+        }
+
+        # GpoBoolean is a PowerShell NetSecurity type, not necessarily [bool].
+        # Interpret only explicit True/False text; never coerce an unknown value.
+        $enabledText = ([string]$enabledProperty.Value).Trim()
+
+        if ($enabledText -ieq 'True') {
+            $actual = $true
+        }
+        elseif ($enabledText -ieq 'False') {
+            $actual = $false
+        }
+        else {
+            $results.Add((New-WINAPResult -Category 'Firewall' -Check "$profileName profile" -Status 'UNKNOWN' -Expected ([string]$expected) -Actual $enabledText -Message 'The profile Enabled state was not an explicit True or False value. No conclusion was inferred.'))
+            continue
+        }
+
+        $status = if ($actual -eq $expected) { 'PASS' } else { 'FAIL' }
+
+        $results.Add((New-WINAPResult -Category 'Firewall' -Check "$profileName profile" -Status $status -Expected ([string]$expected) -Actual ([string]$actual) -Message 'Read firewall profile state. WINAP does not modify firewall settings.'))
+    }
+
+    # TLS registry indicators are read-only. Even AuditOnly entries are
+    # inspected; explicit states are informational unless a baseline is set.
     foreach ($tlsName in @('TLS 1.0','TLS 1.1','TLS 1.2')) {
         $expectedProperty = $Configuration.baseline.tlsProtocols.PSObject.Properties[$tlsName]
         $expected = if ($null -ne $expectedProperty) { [string]$expectedProperty.Value } else { 'AuditOnly' }
-        if ($expected -eq 'AuditOnly') {
-            $results.Add((New-WINAPResult -Category 'TLS' -Check "$tlsName server protocol indicator" -Status 'INFO' -Expected 'AuditOnly' -Actual 'Not evaluated against baseline' -Message 'This protocol is included for observation only by configuration.'))
-            continue
-        }
         $version = $tlsName.Replace('TLS ','')
         $regPath = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS $version\Server"
+
         try {
-            if (-not (Test-Path -LiteralPath $regPath)) {
+            if (-not (Test-Path -LiteralPath $regPath -ErrorAction Stop)) {
                 $results.Add((New-WINAPResult -Category 'TLS' -Check "$tlsName server protocol indicator" -Status 'UNKNOWN' -Expected $expected -Actual 'Registry key absent' -Message 'The explicit registry key is absent. Windows defaults or policy may apply; absence is not treated as enabled or disabled.'))
                 continue
             }
+
             $values = Get-ItemProperty -LiteralPath $regPath -ErrorAction Stop
-            $hasEnabled = $null -ne $values.PSObject.Properties['Enabled']
-            $hasDisabled = $null -ne $values.PSObject.Properties['DisabledByDefault']
-            if (-not ($hasEnabled -and $hasDisabled)) {
+            $enabledProperty = $values.PSObject.Properties['Enabled']
+            $disabledProperty = $values.PSObject.Properties['DisabledByDefault']
+            if ($null -eq $enabledProperty -or $null -eq $disabledProperty) {
                 $results.Add((New-WINAPResult -Category 'TLS' -Check "$tlsName server protocol indicator" -Status 'UNKNOWN' -Expected $expected -Actual 'Incomplete registry values' -Message 'Enabled and DisabledByDefault were not both explicitly set. No conclusion is inferred.'))
                 continue
             }
-            $actual = if ([int]$values.Enabled -eq 1 -and [int]$values.DisabledByDefault -eq 0) { 'Enabled' } elseif ([int]$values.Enabled -eq 0 -and [int]$values.DisabledByDefault -eq 1) { 'Disabled' } else { 'Ambiguous' }
-            $status = if ($actual -eq 'Ambiguous') { 'UNKNOWN' } elseif ($actual -eq $expected) { 'PASS' } else { 'FAIL' }
-            $results.Add((New-WINAPResult -Category 'TLS' -Check "$tlsName server protocol indicator" -Status $status -Expected $expected -Actual $actual -Message 'Read explicit Schannel server registry indicators only. WINAP does not modify TLS settings.'))
-        } catch { $results.Add((New-WINAPResult -Category 'TLS' -Check "$tlsName server protocol indicator" -Status 'UNKNOWN' -Expected $expected -Actual 'Read error' -Message $_.Exception.Message)) }
+
+            $enabledValue = $enabledProperty.Value
+            $disabledValue = $disabledProperty.Value
+            if ($enabledValue -notin @(0,1) -or $disabledValue -notin @(0,1)) {
+                $actual = 'Ambiguous'
+            }
+            elseif ([int]$enabledValue -eq 1 -and [int]$disabledValue -eq 0) {
+                $actual = 'Enabled'
+            }
+            elseif ([int]$enabledValue -eq 0 -and [int]$disabledValue -eq 1) {
+                $actual = 'Disabled'
+            }
+            else {
+                $actual = 'Ambiguous'
+            }
+
+            if ($actual -eq 'Ambiguous') {
+                $status = 'UNKNOWN'
+                $message = 'Registry values do not establish an unambiguous enabled or disabled state.'
+            }
+            elseif ($expected -eq 'AuditOnly') {
+                $status = 'INFO'
+                $message = 'Read explicit Schannel server registry indicators for observation only. WINAP does not modify TLS settings.'
+            }
+            else {
+                $status = if ($actual -eq $expected) { 'PASS' } else { 'FAIL' }
+                $message = 'Read explicit Schannel server registry indicators only. WINAP does not modify TLS settings.'
+            }
+
+            $results.Add((New-WINAPResult -Category 'TLS' -Check "$tlsName server protocol indicator" -Status $status -Expected $expected -Actual $actual -Message $message))
+        }
+        catch {
+            $results.Add((New-WINAPResult -Category 'TLS' -Check "$tlsName server protocol indicator" -Status 'UNKNOWN' -Expected $expected -Actual 'Read error' -Message $_.Exception.Message))
+        }
     }
+
     return @($results.ToArray())
 }
 
