@@ -1,6 +1,6 @@
-Set-StrictMode -Version 2.0
+﻿Set-StrictMode -Version 2.0
 
-$script:WINAPVersion = '1.0.0'
+$script:WINAPVersion = '0.4.0'
 $script:AllowedFeatures = @('RSAT-AD-PowerShell', 'GPMC')
 
 function New-WINAPResult {
@@ -225,30 +225,32 @@ function Invoke-WINAPAudit {
             continue
         }
 
-                $enabledProperty = $matches[0].PSObject.Properties['Enabled']
-
+        $enabledProperty = $matches[0].PSObject.Properties['Enabled']
         if ($null -eq $enabledProperty -or $null -eq $enabledProperty.Value) {
             $results.Add((New-WINAPResult -Category 'Firewall' -Check "$profileName profile" -Status 'UNKNOWN' -Expected ([string]$expected) -Actual 'Ambiguous or unavailable' -Message 'The profile Enabled state was missing or null. No conclusion was inferred.'))
             continue
         }
 
-        # GpoBoolean is a PowerShell NetSecurity type, not necessarily [bool].
-        # Interpret only explicit True/False text; never coerce an unknown value.
-        $enabledText = ([string]$enabledProperty.Value).Trim()
-
-        if ($enabledText -ieq 'True') {
-            $actual = $true
+        # Get-NetFirewallProfile can return the NetSecurity GpoBoolean wrapper
+        # rather than a native [bool] on Windows Server. Accept only explicit
+        # True/False representations; all other values remain UNKNOWN.
+        $rawEnabled = $enabledProperty.Value
+        if ($rawEnabled -is [bool]) {
+            $actual = $rawEnabled
         }
-        elseif ($enabledText -ieq 'False') {
-            $actual = $false
+        elseif ($rawEnabled -is [string] -and $rawEnabled -in @('True', 'False')) {
+            $actual = [System.Convert]::ToBoolean($rawEnabled)
+        }
+        elseif ($rawEnabled.GetType().FullName -eq 'Microsoft.PowerShell.Cmdletization.GeneratedTypes.NetSecurity.GpoBoolean' -and $rawEnabled.ToString() -in @('True', 'False')) {
+            $actual = [System.Convert]::ToBoolean($rawEnabled.ToString())
         }
         else {
-            $results.Add((New-WINAPResult -Category 'Firewall' -Check "$profileName profile" -Status 'UNKNOWN' -Expected ([string]$expected) -Actual $enabledText -Message 'The profile Enabled state was not an explicit True or False value. No conclusion was inferred.'))
+            $rawType = $rawEnabled.GetType().FullName
+            $results.Add((New-WINAPResult -Category 'Firewall' -Check "$profileName profile" -Status 'UNKNOWN' -Expected ([string]$expected) -Actual 'Ambiguous or unavailable' -Message "The profile Enabled state has an unsupported type or value ('$rawType' / '$rawEnabled'). No conclusion was inferred."))
             continue
         }
 
         $status = if ($actual -eq $expected) { 'PASS' } else { 'FAIL' }
-
         $results.Add((New-WINAPResult -Category 'Firewall' -Check "$profileName profile" -Status $status -Expected ([string]$expected) -Actual ([string]$actual) -Message 'Read firewall profile state. WINAP does not modify firewall settings.'))
     }
 
@@ -378,47 +380,159 @@ function Invoke-WINAPFeatureInstallation {
     return @($results.ToArray())
 }
 
+function Invoke-WINAPSMB1RemediationCore {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][bool]$ConfigurationEnabled,
+        [Parameter(Mandatory)][bool]$CommandLineOptIn,
+        [Parameter(Mandatory)][bool]$ImpactAcknowledged,
+        [Parameter(Mandatory)][bool]$Preview,
+        [Parameter(Mandatory)][bool]$IsAdministrator,
+        [Parameter(Mandatory)][bool]$EnvironmentSupported,
+        [Parameter(Mandatory)][bool]$CmdletsAvailable,
+        [Parameter(Mandatory)][scriptblock]$GetServerConfiguration,
+        [Parameter(Mandatory)][scriptblock]$SetServerConfiguration,
+        [Parameter(Mandatory)][scriptblock]$GetOperatingSystem
+    )
+
+    $check = 'Disable SMBv1 server protocol'
+    if (-not $ConfigurationEnabled) {
+        return @((New-WINAPResult -Category 'Remediation' -Check $check -Status 'SKIPPED' -Expected 'remediation.enabled=true' -Actual 'false' -Message 'Both configuration opt-in and -RemediateSMB1 are required.'))
+    }
+    if (-not $CommandLineOptIn) {
+        return @((New-WINAPResult -Category 'Remediation' -Check $check -Status 'SKIPPED' -Expected 'Explicit command-line opt-in' -Actual 'Not authorized' -Message 'Audit-only default. Pass -RemediateSMB1 explicitly to authorize consideration of remediation.'))
+    }
+    if (-not $ImpactAcknowledged) {
+        return @((New-WINAPResult -Category 'Remediation' -Check $check -Status 'SKIPPED' -Expected 'Impact acknowledgement' -Actual 'Not acknowledged' -Message 'No change made. Review legacy dependency impact and rerun with -AcknowledgeSMB1Impact only in an isolated, assessed lab.'))
+    }
+    if ($Preview) {
+        return @((New-WINAPResult -Category 'Remediation' -Check $check -Status 'INFO' -Expected 'SMBv1 server disabled' -Actual 'Preview only' -Message 'All required opt-ins and acknowledgement are present, but preview mode never changes the server.'))
+    }
+    if (-not $IsAdministrator) {
+        return @((New-WINAPResult -Category 'Remediation' -Check $check -Status 'FAIL' -Expected 'Administrator privileges' -Actual 'Not elevated' -Message 'No change attempted. Run an elevated Windows PowerShell session.'))
+    }
+    if (-not $EnvironmentSupported) {
+        return @((New-WINAPResult -Category 'Remediation' -Check $check -Status 'SKIPPED' -Expected 'Windows Server 2022' -Actual 'Unsupported or unavailable OS state' -Message 'The operating-system safety check did not confirm Windows Server 2022; no change attempted.'))
+    }
+    if (-not $CmdletsAvailable) {
+        return @((New-WINAPResult -Category 'Remediation' -Check $check -Status 'SKIPPED' -Expected 'Supported SMB server cmdlets' -Actual 'Unavailable' -Message 'Required SMB server cmdlets are unavailable; no change attempted.'))
+    }
+
+    try {
+        $before = & $GetServerConfiguration
+    }
+    catch {
+        return @((New-WINAPResult -Category 'Remediation' -Check $check -Status 'SKIPPED' -Expected 'Readable Boolean state' -Actual 'Read error' -Message "Could not read the current SMBv1 server state; no change attempted: $($_.Exception.Message)"))
+    }
+
+    $beforeProperty = if ($null -ne $before) { $before.PSObject.Properties['EnableSMB1Protocol'] } else { $null }
+    if ($null -eq $beforeProperty -or $beforeProperty.Value -isnot [bool]) {
+        return @((New-WINAPResult -Category 'Remediation' -Check $check -Status 'SKIPPED' -Expected 'Readable Boolean state' -Actual 'Ambiguous or unavailable' -Message 'Current SMBv1 server state is missing, unsupported, or not Boolean; no change attempted.'))
+    }
+    if ($beforeProperty.Value -eq $false) {
+        return @((New-WINAPResult -Category 'Remediation' -Check $check -Status 'PASS' -Expected 'Disabled' -Actual 'Already disabled' -Message 'No change needed; SMBv1 server protocol was already disabled.'))
+    }
+
+    try {
+        $os = & $GetOperatingSystem
+        if ($null -eq $os -or [string]$os.Caption -notmatch 'Windows Server 2022') {
+            $actualOS = if ($null -eq $os) { 'Unavailable' } else { [string]$os.Caption }
+            return @((New-WINAPResult -Category 'Remediation' -Check $check -Status 'SKIPPED' -Expected 'Windows Server 2022' -Actual $actualOS -Message 'The operating-system safety check failed immediately before the change; no change attempted.'))
+        }
+    }
+    catch {
+        return @((New-WINAPResult -Category 'Remediation' -Check $check -Status 'SKIPPED' -Expected 'Verified Windows Server 2022' -Actual 'OS query error' -Message "Could not verify the operating system immediately before the change; no change attempted: $($_.Exception.Message)"))
+    }
+
+    try {
+        $null = & $SetServerConfiguration $false
+    }
+    catch {
+        $changeError = $_.Exception.Message
+        try {
+            $afterError = & $GetServerConfiguration
+            $afterErrorProperty = if ($null -ne $afterError) { $afterError.PSObject.Properties['EnableSMB1Protocol'] } else { $null }
+            if ($null -ne $afterErrorProperty -and $afterErrorProperty.Value -is [bool] -and $afterErrorProperty.Value -eq $false) {
+                return @((New-WINAPResult -Category 'Remediation' -Check $check -Status 'WARN' -Expected 'Disabled' -Actual 'Disabled after reported error' -Message "The change command reported an error, but the post-check confirms the setting is disabled: $changeError"))
+            }
+        }
+        catch { }
+        return @((New-WINAPResult -Category 'Remediation' -Check $check -Status 'FAIL' -Expected 'Disabled' -Actual 'Not verified' -Message "The change command failed and the intended state was not verified: $changeError"))
+    }
+
+    try {
+        $after = & $GetServerConfiguration
+        $afterProperty = if ($null -ne $after) { $after.PSObject.Properties['EnableSMB1Protocol'] } else { $null }
+        if ($null -eq $afterProperty -or $afterProperty.Value -isnot [bool]) {
+            return @((New-WINAPResult -Category 'Remediation' -Check $check -Status 'UNKNOWN' -Expected 'Disabled' -Actual 'Post-check ambiguous' -Message 'A change was attempted, but the post-check returned a missing or non-Boolean state. WINAP cannot claim success.'))
+        }
+        if ($afterProperty.Value -eq $false) {
+            return @((New-WINAPResult -Category 'Remediation' -Check $check -Status 'PASS' -Expected 'Disabled' -Actual 'Disabled and verified' -Message 'SMBv1 server protocol disablement was verified. No reboot was initiated.'))
+        }
+        return @((New-WINAPResult -Category 'Remediation' -Check $check -Status 'FAIL' -Expected 'Disabled' -Actual 'Still enabled after attempt' -Message 'The change command returned, but the post-check shows SMBv1 server protocol is still enabled.'))
+    }
+    catch {
+        return @((New-WINAPResult -Category 'Remediation' -Check $check -Status 'UNKNOWN' -Expected 'Disabled' -Actual 'Post-check read error' -Message "A change was attempted, but the resulting state could not be read: $($_.Exception.Message)"))
+    }
+}
+
 function Invoke-WINAPSMB1Remediation {
     [CmdletBinding()]
     param([Parameter(Mandatory)][object]$Configuration,[switch]$RemediateSMB1,[switch]$AcknowledgeSMB1Impact,[switch]$Preview)
-    if (-not $RemediateSMB1) { return @((New-WINAPResult -Category 'Remediation' -Check 'Disable SMBv1 server protocol' -Status 'SKIPPED' -Expected 'Explicit CLI opt-in and configuration opt-in' -Actual 'Not authorized' -Message 'Audit-only default. No remediation attempted.')) }
-    if (-not $Configuration.remediation.enabled) { return @((New-WINAPResult -Category 'Remediation' -Check 'Disable SMBv1 server protocol' -Status 'SKIPPED' -Expected 'remediation.enabled=true' -Actual 'false' -Message 'Both configuration opt-in and -RemediateSMB1 are required.')) }
-    if (-not $AcknowledgeSMB1Impact) { return @((New-WINAPResult -Category 'Remediation' -Check 'Disable SMBv1 server protocol' -Status 'SKIPPED' -Expected 'Impact acknowledgement' -Actual 'Not acknowledged' -Message 'No change made. Review legacy dependency impact and rerun with -AcknowledgeSMB1Impact only in an isolated, assessed lab.')) }
-    if ($Preview) { return @((New-WINAPResult -Category 'Remediation' -Check 'Disable SMBv1 server protocol' -Status 'INFO' -Expected 'SMBv1 server disabled' -Actual 'Preview only' -Message 'All CLI acknowledgements are present, but preview mode never changes the server.')) }
-    if (-not (Test-WINAPAdministrator)) { return @((New-WINAPResult -Category 'Remediation' -Check 'Disable SMBv1 server protocol' -Status 'FAIL' -Expected 'Administrator privileges' -Actual 'Not elevated' -Message 'No change attempted. Run an elevated Windows PowerShell session.')) }
-    if (-not (Get-Command Get-SmbServerConfiguration -ErrorAction SilentlyContinue) -or -not (Get-Command Set-SmbServerConfiguration -ErrorAction SilentlyContinue)) { return @((New-WINAPResult -Category 'Remediation' -Check 'Disable SMBv1 server protocol' -Status 'SKIPPED' -Expected 'Supported SMB server cmdlets' -Actual 'Unavailable' -Message 'Required cmdlets are unavailable; no change attempted.')) }
+
+    $osSupported = $false
     try {
-        $before = Get-SmbServerConfiguration -ErrorAction Stop
-        if ($null -eq $before.EnableSMB1Protocol -or $before.EnableSMB1Protocol -isnot [bool]) { return @((New-WINAPResult -Category 'Remediation' -Check 'Disable SMBv1 server protocol' -Status 'SKIPPED' -Expected 'Readable Boolean state' -Actual 'Ambiguous' -Message 'Current state cannot be reliably interpreted; no change attempted.')) }
-        if (-not $before.EnableSMB1Protocol) { return @((New-WINAPResult -Category 'Remediation' -Check 'Disable SMBv1 server protocol' -Status 'PASS' -Expected 'Disabled' -Actual 'Already disabled' -Message 'No change needed; SMBv1 server protocol was already disabled.')) }
-        # Verify server OS again immediately before the mutation.
         $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
-        if ($os.Caption -notmatch 'Windows Server 2022') { return @((New-WINAPResult -Category 'Remediation' -Check 'Disable SMBv1 server protocol' -Status 'SKIPPED' -Expected 'Windows Server 2022' -Actual $os.Caption -Message 'Operating system safety check failed; no change attempted.')) }
-        Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force -ErrorAction Stop
-        $after = Get-SmbServerConfiguration -ErrorAction Stop
-        if ($after.EnableSMB1Protocol -eq $false) {
-            return @((New-WINAPResult -Category 'Remediation' -Check 'Disable SMBv1 server protocol' -Status 'PASS' -Expected 'Disabled' -Actual 'Disabled and verified' -Message 'SMBv1 server protocol disablement was verified. No reboot was initiated.'))
-        }
-        return @((New-WINAPResult -Category 'Remediation' -Check 'Disable SMBv1 server protocol' -Status 'UNKNOWN' -Expected 'Disabled' -Actual 'Post-check did not confirm' -Message 'A change was attempted, but the resulting state could not be verified.'))
-    } catch {
-        $detail = $_.Exception.Message
-        try {
-            $state = Get-SmbServerConfiguration -ErrorAction Stop
-            if ($state.EnableSMB1Protocol -eq $false) { return @((New-WINAPResult -Category 'Remediation' -Check 'Disable SMBv1 server protocol' -Status 'WARN' -Expected 'Disabled' -Actual 'Disabled after reported error' -Message "Command reported an error but post-check shows disabled: $detail")) }
-        } catch { }
-        return @((New-WINAPResult -Category 'Remediation' -Check 'Disable SMBv1 server protocol' -Status 'FAIL' -Expected 'Disabled' -Actual 'Not verified' -Message $detail))
+        $osSupported = ($null -ne $os -and [string]$os.Caption -match 'Windows Server 2022')
     }
+    catch { $osSupported = $false }
+
+    $cmdletsAvailable = [bool](Get-Command Get-SmbServerConfiguration -ErrorAction SilentlyContinue) -and [bool](Get-Command Set-SmbServerConfiguration -ErrorAction SilentlyContinue)
+    $getServerConfiguration = { Get-SmbServerConfiguration -ErrorAction Stop }
+    $setServerConfiguration = { param($enabled) Set-SmbServerConfiguration -EnableSMB1Protocol $enabled -Force -ErrorAction Stop }
+    $getOperatingSystem = { Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop }
+
+    return @(Invoke-WINAPSMB1RemediationCore `
+        -ConfigurationEnabled ([bool]$Configuration.remediation.enabled) `
+        -CommandLineOptIn ([bool]$RemediateSMB1) `
+        -ImpactAcknowledged ([bool]$AcknowledgeSMB1Impact) `
+        -Preview ([bool]$Preview) `
+        -IsAdministrator ([bool](Test-WINAPAdministrator)) `
+        -EnvironmentSupported ([bool]$osSupported) `
+        -CmdletsAvailable ([bool]$cmdletsAvailable) `
+        -GetServerConfiguration $getServerConfiguration `
+        -SetServerConfiguration $setServerConfiguration `
+        -GetOperatingSystem $getOperatingSystem)
 }
 
 function Write-WINAPLog {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][object[]]$Results,[Parameter(Mandatory)][string]$RunId)
-    $lines = New-Object System.Collections.Generic.List[string]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][object[]]$Results,
+        [Parameter(Mandatory)][string]$RunId
+    )
+
+    $lines = New-Object 'System.Collections.Generic.List[string]'
     $lines.Add("WINAP $script:WINAPVersion execution log")
     $lines.Add("Run ID: $RunId")
     $lines.Add("Started/recorded: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ssK')")
-    foreach ($r in $Results) { $lines.Add(('[{0}] [{1}] {2} — {3}' -f $r.Status,$r.Category,$r.Check,$r.Message)) }
-    $lines | Set-Content -LiteralPath $Path -Encoding UTF8
+
+    foreach ($r in $Results) {
+        # ASCII-only separator avoids source-codepage corruption in Windows PowerShell 5.1.
+        $line = '[' + [string]$r.Status + '] [' + [string]$r.Category + '] ' +
+            [string]$r.Check + ' - ' + [string]$r.Message
+        $lines.Add($line)
+    }
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $directory = [System.IO.Path]::GetDirectoryName($fullPath)
+    if (-not [System.IO.Directory]::Exists($directory)) {
+        [System.IO.Directory]::CreateDirectory($directory) | Out-Null
+    }
+
+    # Windows PowerShell 5.1's UTF8 encoding writes a BOM; all log content is ASCII-safe.
+    Set-Content -LiteralPath $fullPath -Value $lines.ToArray() -Encoding UTF8
 }
 
 function ConvertTo-WINAPHtmlEncoded {
@@ -443,7 +557,7 @@ function Write-WINAPHtmlReport {
 <style>
 body{font-family:Segoe UI,Arial,sans-serif;margin:2rem;color:#17202a;background:#f7f9fb}h1{margin-bottom:.2rem}.muted{color:#5d6d7e}.summary{display:flex;flex-wrap:wrap;gap:.7rem;margin:1.2rem 0}.tile{background:white;border:1px solid #d5dbe1;border-radius:8px;padding:.8rem 1rem;min-width:80px}.tile b{display:block;font-size:1.5rem}table{width:100%;border-collapse:collapse;background:white}th,td{padding:.65rem;text-align:left;border:1px solid #d5dbe1;vertical-align:top}th{background:#eaf0f6}.status{font-weight:700}.status-PASS{color:#196f3d}.status-FAIL{color:#922b21}.status-WARN{color:#9a7d0a}.status-UNKNOWN{color:#566573}.status-SKIPPED{color:#5b2c6f}.status-INFO{color:#2471a3}code{word-break:break-all}@media(max-width:900px){table{font-size:.85rem}body{margin:.5rem}}
 </style></head><body>
-<h1>WINAP — Windows Infrastructure Automation Platform</h1><p class="muted">Execution report · Version $script:WINAPVersion · Run ID $(ConvertTo-WINAPHtmlEncoded $RunId)</p>
+<h1>WINAP - Windows Infrastructure Automation Platform</h1><p class="muted">Execution report - Version $script:WINAPVersion - Run ID $(ConvertTo-WINAPHtmlEncoded $RunId)</p>
 <h2>Run summary</h2><p><b>Mode:</b> $(ConvertTo-WINAPHtmlEncoded $Mode) &nbsp; <b>Computer:</b> $(ConvertTo-WINAPHtmlEncoded $Inventory.ComputerName) &nbsp; <b>OS:</b> $(ConvertTo-WINAPHtmlEncoded $Inventory.OperatingSystem) &nbsp; <b>Generated:</b> $(Get-Date -Format 'yyyy-MM-dd HH:mm:ssK')</p>
 <div class="summary"><div class="tile"><b>$($Results.Count)</b>Total checks/results</div><div class="tile"><b>$($counts.PASS)</b>Pass</div><div class="tile"><b>$($counts.FAIL)</b>Fail</div><div class="tile"><b>$($counts.WARN)</b>Warning</div><div class="tile"><b>$($counts.UNKNOWN)</b>Unknown</div><div class="tile"><b>$($counts.SKIPPED)</b>Skipped</div></div>
 <h2>Inventory</h2><table><tbody>

@@ -2,15 +2,25 @@
 
 All notable changes to WINAP are documented here. Entries describe actual changes and verified results; pending runtime checks are identified explicitly.
 
-## Unreleased
+## [0.4.0] - 2026-10-25
 
-### Phase 3 — Baseline Auditing (runtime verification pending)
+### Phase 4 — Controlled Operations
+
+- Added guarded SMBv1 remediation and safety checks.
+- Added tests for remediation safeguards, failure handling, and verification.
+- Corrected the application entry point and Windows PowerShell 5.1 logging compatibility.
+- Verified 40 tests passed; Preview generated the HTML report and execution log. No actual remediation was performed.
+
+## [0.3.0] - 2026-10-24
+
+### Phase 3 — Baseline Auditing
 
 - Updated SMBv1 auditing to report missing or non-Boolean state as `UNKNOWN` rather than coercing it to `False`.
 - Updated firewall auditing to report Domain, Private, and Public profiles separately, including unavailable or ambiguous states.
 - Updated TLS auditing to inspect configured server-side Schannel indicators even when a protocol is configured as `AuditOnly`; absent or ambiguous values remain `UNKNOWN`.
 - Expanded the built-in test harness to check for the seven expected audit results and conservative `AuditOnly` TLS statuses.
-- Runtime verification of these Phase 3 changes is pending on the Windows Server 2022 VM.
+
+## [0.2.0] - 2026-10-24
 
 ### Phase 2 — Configuration and Safety Validation
 
@@ -18,13 +28,6 @@ All notable changes to WINAP are documented here. Entries describe actual change
 - Updated the unknown-configuration-key test to use `Add-Member`, compatible with Windows PowerShell 5.1.
 - Previously reported built-in tests: 11 passed, 0 failed.
 - Previously reported Windows Server Preview: 11 results, 6 PASS, 0 FAIL, 0 UNKNOWN.
-- These earlier results do not verify the Phase 3 changes in this package.
-
-### Verification limitations
-
-- The built-in tests do not replace the target VM integration run.
-- TLS defaults and policy may depend on Windows configuration; absent or ambiguous registry indicators are not interpreted as proof of enabled or disabled state.
-- SMBv1 remediation and feature installation are not part of Phase 3 execution and must not be triggered during the audit verification run.
 
 ## [0.1.0] - 2026-10-24
 
