@@ -1,6 +1,6 @@
 ﻿Set-StrictMode -Version 2.0
 
-$script:WINAPVersion = '0.4.0'
+$script:WINAPVersion = '0.5.0'
 $script:AllowedFeatures = @('RSAT-AD-PowerShell', 'GPMC')
 
 function New-WINAPResult {
@@ -120,6 +120,9 @@ function Import-WINAPConfiguration {
     }
     if ([IO.Path]::IsPathRooted([string]$cfg.reporting.htmlReport) -or [IO.Path]::GetFileName([string]$cfg.reporting.htmlReport) -ne [string]$cfg.reporting.htmlReport) { throw 'reporting.htmlReport must be a file name, not a path.' }
     if ([IO.Path]::IsPathRooted([string]$cfg.reporting.logFile) -or [IO.Path]::GetFileName([string]$cfg.reporting.logFile) -ne [string]$cfg.reporting.logFile) { throw 'reporting.logFile must be a file name, not a path.' }
+    if ([string]::Equals([string]$cfg.reporting.htmlReport, [string]$cfg.reporting.logFile, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'reporting.htmlReport and reporting.logFile must use different file names.'
+    }
     return $cfg
 }
 
@@ -505,23 +508,67 @@ function Invoke-WINAPSMB1Remediation {
         -GetOperatingSystem $getOperatingSystem)
 }
 
+function Get-WINAPOverallStatus {
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][object[]]$Results = @())
+
+    if (@($Results | Where-Object { $_.Status -eq 'FAIL' }).Count -gt 0) {
+        return 'FAILED'
+    }
+    if (@($Results | Where-Object { $_.Status -in @('WARN','UNKNOWN') }).Count -gt 0) {
+        return 'COMPLETED WITH WARNINGS'
+    }
+    if (@($Results | Where-Object { $_.Status -eq 'SKIPPED' }).Count -gt 0) {
+        return 'COMPLETED WITH SKIPPED ACTIONS'
+    }
+    return 'COMPLETED'
+}
+
 function Write-WINAPLog {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][object[]]$Results,
-        [Parameter(Mandatory)][string]$RunId
+        [Parameter(Mandatory)][string]$RunId,
+        [string]$Mode = 'Audit',
+        [datetime]$StartedAt = (Get-Date),
+        [AllowNull()][object]$Inventory = $null,
+        [string]$ReportPath = ''
     )
 
+    $finishedAt = Get-Date
+    $duration = [math]::Round(($finishedAt - $StartedAt).TotalSeconds, 2)
+    $overallStatus = Get-WINAPOverallStatus -Results $Results
     $lines = New-Object 'System.Collections.Generic.List[string]'
     $lines.Add("WINAP $script:WINAPVersion execution log")
     $lines.Add("Run ID: $RunId")
-    $lines.Add("Started/recorded: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ssK')")
+    $lines.Add("Mode: $Mode")
+    $lines.Add("Started: $($StartedAt.ToString('yyyy-MM-dd HH:mm:ssK'))")
+    $lines.Add("Finished: $($finishedAt.ToString('yyyy-MM-dd HH:mm:ssK'))")
+    $lines.Add("Duration seconds: $duration")
+    $lines.Add("Overall status: $overallStatus")
+
+    if ($null -ne $Inventory) {
+        $lines.Add('Inventory:')
+        foreach ($name in @('ComputerName','Domain','OperatingSystem','OSVersion','OSBuild','PowerShellVersion','IsAdministrator','LastBootTime','CDriveFreeGB')) {
+            $property = $Inventory.PSObject.Properties[$name]
+            if ($null -ne $property) {
+                $value = if ($null -eq $property.Value) { 'Unknown' } else { [string]$property.Value }
+                $value = $value -replace '[\r\n]+', ' '
+                $lines.Add("  ${name}: $value")
+            }
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ReportPath)) {
+        $lines.Add("HTML report: $ReportPath")
+    }
+    $lines.Add('Results:')
 
     foreach ($r in $Results) {
-        # ASCII-only separator avoids source-codepage corruption in Windows PowerShell 5.1.
-        $line = '[' + [string]$r.Status + '] [' + [string]$r.Category + '] ' +
-            [string]$r.Check + ' - ' + [string]$r.Message
+        $message = ([string]$r.Message) -replace '[\r\n]+', ' '
+        $check = ([string]$r.Check) -replace '[\r\n]+', ' '
+        $category = ([string]$r.Category) -replace '[\r\n]+', ' '
+        $line = '[' + [string]$r.Status + '] [' + $category + '] ' + $check + ' - ' + $message
         $lines.Add($line)
     }
 
@@ -531,8 +578,8 @@ function Write-WINAPLog {
         [System.IO.Directory]::CreateDirectory($directory) | Out-Null
     }
 
-    # Windows PowerShell 5.1's UTF8 encoding writes a BOM; all log content is ASCII-safe.
-    Set-Content -LiteralPath $fullPath -Value $lines.ToArray() -Encoding UTF8
+    # Windows PowerShell 5.1's UTF8 encoding writes a BOM; content is kept readable and ASCII-safe.
+    Set-Content -LiteralPath $fullPath -Value $lines.ToArray() -Encoding UTF8 -ErrorAction Stop
 }
 
 function ConvertTo-WINAPHtmlEncoded {
@@ -543,23 +590,54 @@ function ConvertTo-WINAPHtmlEncoded {
 
 function Write-WINAPHtmlReport {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][object[]]$Results,[Parameter(Mandatory)][object]$Inventory,[Parameter(Mandatory)][string]$RunId,[Parameter(Mandatory)][string]$Mode)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][object[]]$Results,
+        [Parameter(Mandatory)][object]$Inventory,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][string]$Mode,
+        [string]$LogPath = '',
+        [datetime]$StartedAt = (Get-Date)
+    )
+
+    $finishedAt = Get-Date
+    $duration = [math]::Round(($finishedAt - $StartedAt).TotalSeconds, 2)
+    $overallStatus = Get-WINAPOverallStatus -Results $Results
     $counts = @{}
-    foreach ($status in @('PASS','FAIL','WARN','UNKNOWN','SKIPPED','INFO')) { $counts[$status] = @($Results | Where-Object { $_.Status -eq $status }).Count }
+    foreach ($status in @('PASS','FAIL','WARN','UNKNOWN','SKIPPED','INFO')) {
+        $counts[$status] = @($Results | Where-Object { $_.Status -eq $status }).Count
+    }
+
     $rows = New-Object System.Collections.Generic.List[string]
     foreach ($r in $Results) {
-        $rows.Add('<tr><td class="status status-' + (ConvertTo-WINAPHtmlEncoded $r.Status) + '">' + (ConvertTo-WINAPHtmlEncoded $r.Status) + '</td><td>' + (ConvertTo-WINAPHtmlEncoded $r.Category) + '</td><td>' + (ConvertTo-WINAPHtmlEncoded $r.Check) + '</td><td>' + (ConvertTo-WINAPHtmlEncoded $r.Expected) + '</td><td>' + (ConvertTo-WINAPHtmlEncoded $r.Actual) + '</td><td>' + (ConvertTo-WINAPHtmlEncoded $r.Message) + '</td></tr>')
+        $rows.Add('<tr><td class="status status-' + (ConvertTo-WINAPHtmlEncoded $r.Status) + '">' +
+            (ConvertTo-WINAPHtmlEncoded $r.Status) + '</td><td>' +
+            (ConvertTo-WINAPHtmlEncoded $r.Category) + '</td><td>' +
+            (ConvertTo-WINAPHtmlEncoded $r.Check) + '</td><td>' +
+            (ConvertTo-WINAPHtmlEncoded $r.Expected) + '</td><td>' +
+            (ConvertTo-WINAPHtmlEncoded $r.Actual) + '</td><td>' +
+            (ConvertTo-WINAPHtmlEncoded $r.Message) + '</td></tr>')
     }
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $directory = [System.IO.Path]::GetDirectoryName($fullPath)
+    if (-not [System.IO.Directory]::Exists($directory)) {
+        [System.IO.Directory]::CreateDirectory($directory) | Out-Null
+    }
+
     $html = @"
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WINAP Audit Report</title>
+<title>WINAP Execution Report</title>
 <style>
-body{font-family:Segoe UI,Arial,sans-serif;margin:2rem;color:#17202a;background:#f7f9fb}h1{margin-bottom:.2rem}.muted{color:#5d6d7e}.summary{display:flex;flex-wrap:wrap;gap:.7rem;margin:1.2rem 0}.tile{background:white;border:1px solid #d5dbe1;border-radius:8px;padding:.8rem 1rem;min-width:80px}.tile b{display:block;font-size:1.5rem}table{width:100%;border-collapse:collapse;background:white}th,td{padding:.65rem;text-align:left;border:1px solid #d5dbe1;vertical-align:top}th{background:#eaf0f6}.status{font-weight:700}.status-PASS{color:#196f3d}.status-FAIL{color:#922b21}.status-WARN{color:#9a7d0a}.status-UNKNOWN{color:#566573}.status-SKIPPED{color:#5b2c6f}.status-INFO{color:#2471a3}code{word-break:break-all}@media(max-width:900px){table{font-size:.85rem}body{margin:.5rem}}
+body{font-family:Segoe UI,Arial,sans-serif;margin:2rem;color:#17202a;background:#f7f9fb}h1{margin-bottom:.2rem}.muted{color:#5d6d7e}.summary{display:flex;flex-wrap:wrap;gap:.7rem;margin:1.2rem 0}.tile{background:white;border:1px solid #d5dbe1;border-radius:8px;padding:.8rem 1rem;min-width:80px}.tile b{display:block;font-size:1.5rem}table{width:100%;border-collapse:collapse;background:white}th,td{padding:.65rem;text-align:left;border:1px solid #d5dbe1;vertical-align:top;overflow-wrap:anywhere}th{background:#eaf0f6}.status{font-weight:700}.status-PASS{color:#196f3d}.status-FAIL{color:#922b21}.status-WARN{color:#9a7d0a}.status-UNKNOWN{color:#566573}.status-SKIPPED{color:#5b2c6f}.status-INFO{color:#2471a3}.overall{font-weight:700}code{word-break:break-all}@media(max-width:900px){table{font-size:.85rem}body{margin:.5rem}}
 </style></head><body>
-<h1>WINAP - Windows Infrastructure Automation Platform</h1><p class="muted">Execution report - Version $script:WINAPVersion - Run ID $(ConvertTo-WINAPHtmlEncoded $RunId)</p>
-<h2>Run summary</h2><p><b>Mode:</b> $(ConvertTo-WINAPHtmlEncoded $Mode) &nbsp; <b>Computer:</b> $(ConvertTo-WINAPHtmlEncoded $Inventory.ComputerName) &nbsp; <b>OS:</b> $(ConvertTo-WINAPHtmlEncoded $Inventory.OperatingSystem) &nbsp; <b>Generated:</b> $(Get-Date -Format 'yyyy-MM-dd HH:mm:ssK')</p>
-<div class="summary"><div class="tile"><b>$($Results.Count)</b>Total checks/results</div><div class="tile"><b>$($counts.PASS)</b>Pass</div><div class="tile"><b>$($counts.FAIL)</b>Fail</div><div class="tile"><b>$($counts.WARN)</b>Warning</div><div class="tile"><b>$($counts.UNKNOWN)</b>Unknown</div><div class="tile"><b>$($counts.SKIPPED)</b>Skipped</div></div>
+<h1>WINAP - Windows Infrastructure Automation Platform</h1>
+<p class="muted">Version $(ConvertTo-WINAPHtmlEncoded $script:WINAPVersion) | Run ID $(ConvertTo-WINAPHtmlEncoded $RunId)</p>
+<h2>Run summary</h2>
+<p><b>Overall status:</b> <span class="overall">$(ConvertTo-WINAPHtmlEncoded $overallStatus)</span> &nbsp; <b>Mode:</b> $(ConvertTo-WINAPHtmlEncoded $Mode) &nbsp; <b>Computer:</b> $(ConvertTo-WINAPHtmlEncoded $Inventory.ComputerName) &nbsp; <b>OS:</b> $(ConvertTo-WINAPHtmlEncoded $Inventory.OperatingSystem)</p>
+<p><b>Started:</b> $(ConvertTo-WINAPHtmlEncoded ($StartedAt.ToString('yyyy-MM-dd HH:mm:ssK'))) &nbsp; <b>Generated:</b> $(ConvertTo-WINAPHtmlEncoded ($finishedAt.ToString('yyyy-MM-dd HH:mm:ssK'))) &nbsp; <b>Duration:</b> $duration seconds</p>
+<div class="summary"><div class="tile"><b>$($Results.Count)</b>Total results</div><div class="tile"><b>$($counts.PASS)</b>Pass</div><div class="tile"><b>$($counts.FAIL)</b>Fail</div><div class="tile"><b>$($counts.WARN)</b>Warning</div><div class="tile"><b>$($counts.UNKNOWN)</b>Unknown</div><div class="tile"><b>$($counts.SKIPPED)</b>Skipped</div><div class="tile"><b>$($counts.INFO)</b>Info</div></div>
 <h2>Inventory</h2><table><tbody>
 <tr><th>Computer name</th><td>$(ConvertTo-WINAPHtmlEncoded $Inventory.ComputerName)</td><th>Domain/workgroup</th><td>$(ConvertTo-WINAPHtmlEncoded $Inventory.Domain)</td></tr>
 <tr><th>Operating system</th><td>$(ConvertTo-WINAPHtmlEncoded $Inventory.OperatingSystem)</td><th>Build</th><td>$(ConvertTo-WINAPHtmlEncoded $Inventory.OSBuild)</td></tr>
@@ -568,9 +646,75 @@ body{font-family:Segoe UI,Arial,sans-serif;margin:2rem;color:#17202a;background:
 </tbody></table>
 <h2>Checks, actions, and outcomes</h2><table><thead><tr><th>Status</th><th>Category</th><th>Check</th><th>Expected</th><th>Actual</th><th>Details</th></tr></thead><tbody>
 $($rows -join "`n")
-</tbody></table><p class="muted">WINAP is a learning/portfolio utility, not a certified vulnerability scanner. UNKNOWN means the available evidence was insufficient to reach a reliable conclusion. Review findings before making operational decisions.</p></body></html>
+</tbody></table>
+<h2>Output files</h2><p><b>Execution log:</b> <code>$(ConvertTo-WINAPHtmlEncoded $LogPath)</code></p>
+<p class="muted">WINAP is a learning/portfolio utility, not a certified vulnerability scanner. UNKNOWN means the available evidence was insufficient to reach a reliable conclusion. Review findings before making operational decisions.</p>
+</body></html>
 "@
-    Set-Content -LiteralPath $Path -Value $html -Encoding UTF8
+    Set-Content -LiteralPath $fullPath -Value $html -Encoding UTF8 -ErrorAction Stop
+}
+
+function Complete-WINAPRun {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$OutputDirectory,
+        [Parameter(Mandatory)][string]$ReportName,
+        [Parameter(Mandatory)][string]$LogName,
+        [Parameter(Mandatory)][object[]]$Results,
+        [Parameter(Mandatory)][object]$Inventory,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][string]$Mode,
+        [Parameter(Mandatory)][datetime]$StartedAt
+    )
+
+    $resultList = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($result in $Results) { $resultList.Add($result) }
+    $reportPath = Join-Path $OutputDirectory $ReportName
+    $logPath = Join-Path $OutputDirectory $LogName
+    $reportWritten = $false
+    $logWritten = $false
+
+    try {
+        if (Test-Path -LiteralPath $OutputDirectory -PathType Leaf) {
+            throw "Output directory path points to a file: $OutputDirectory"
+        }
+        if (-not (Test-Path -LiteralPath $OutputDirectory -PathType Container)) {
+            New-Item -ItemType Directory -Path $OutputDirectory -Force -ErrorAction Stop | Out-Null
+        }
+    }
+    catch {
+        $resultList.Add((New-WINAPResult -Category 'Reporting' -Check 'Output directory' -Status 'FAIL' -Expected 'Writable output directory' -Actual 'Directory unavailable' -Message $_.Exception.Message))
+        return [PSCustomObject]@{ Results = @($resultList.ToArray()); ReportPath = $reportPath; LogPath = $logPath; ReportWritten = $false; LogWritten = $false }
+    }
+
+    try {
+        Write-WINAPHtmlReport -Path $reportPath -Results @($resultList.ToArray()) -Inventory $Inventory -RunId $RunId -Mode $Mode -LogPath $logPath -StartedAt $StartedAt -ErrorAction Stop
+        $reportWritten = $true
+    }
+    catch {
+        $resultList.Add((New-WINAPResult -Category 'Reporting' -Check 'HTML report generation' -Status 'FAIL' -Expected 'Standalone HTML report written' -Actual 'Report not generated' -Message $_.Exception.Message))
+    }
+
+    try {
+        Write-WINAPLog -Path $logPath -Results @($resultList.ToArray()) -RunId $RunId -Mode $Mode -StartedAt $StartedAt -Inventory $Inventory -ReportPath $reportPath -ErrorAction Stop
+        $logWritten = $true
+    }
+    catch {
+        $resultList.Add((New-WINAPResult -Category 'Reporting' -Check 'Execution log generation' -Status 'FAIL' -Expected 'Execution log written' -Actual 'Log not generated' -Message $_.Exception.Message))
+    }
+
+    # If log creation failed, refresh an otherwise successful report so it reflects that failure.
+    if (-not $logWritten -and $reportWritten) {
+        try {
+            Write-WINAPHtmlReport -Path $reportPath -Results @($resultList.ToArray()) -Inventory $Inventory -RunId $RunId -Mode $Mode -LogPath $logPath -StartedAt $StartedAt -ErrorAction Stop
+        }
+        catch {
+            $reportWritten = $false
+            $resultList.Add((New-WINAPResult -Category 'Reporting' -Check 'HTML report refresh' -Status 'FAIL' -Expected 'Report reflects output errors' -Actual 'Report could not be refreshed' -Message $_.Exception.Message))
+        }
+    }
+
+    return [PSCustomObject]@{ Results = @($resultList.ToArray()); ReportPath = $reportPath; LogPath = $logPath; ReportWritten = $reportWritten; LogWritten = $logWritten }
 }
 
 function Invoke-WINAP {
@@ -606,29 +750,35 @@ function Invoke-WINAP {
         $inventory = [PSCustomObject]@{ ComputerName=$env:COMPUTERNAME; Domain='Unknown'; OperatingSystem='Unknown'; OSBuild='Unknown'; PowerShellVersion=$PSVersionTable.PSVersion.ToString(); CDriveFreeGB=$null; IsAdministrator=(Test-WINAPAdministrator); LastBootTime='Unknown' }
     }
 
-    # Report paths are resolved relative to the project root unless outputDirectory is absolute.
+    # Resolve configured output paths; invalid configuration falls back to a run-specific output name.
     $outputDir = Join-Path $root 'output'
     if ($null -ne $cfg -and -not [string]::IsNullOrWhiteSpace([string]$cfg.reporting.outputDirectory)) {
         if ([IO.Path]::IsPathRooted([string]$cfg.reporting.outputDirectory)) { $outputDir = [string]$cfg.reporting.outputDirectory }
         else { $outputDir = Join-Path $root ([string]$cfg.reporting.outputDirectory) }
     }
-    try {
-        if (-not (Test-Path -LiteralPath $outputDir -PathType Container)) { New-Item -ItemType Directory -Path $outputDir -Force | Out-Null }
-        $logName = if ($null -ne $cfg) { [string]$cfg.reporting.logFile } else { "WINAP-$runId.log" }
-        $reportName = if ($null -ne $cfg) { [string]$cfg.reporting.htmlReport } else { "WINAP-$runId.html" }
-        $logPath = Join-Path $outputDir $logName
-        $reportPath = Join-Path $outputDir $reportName
-        Write-WINAPLog -Path $logPath -Results @($allResults.ToArray()) -RunId $runId
-        Write-WINAPHtmlReport -Path $reportPath -Results @($allResults.ToArray()) -Inventory $inventory -RunId $runId -Mode $mode
-        Write-Host "`nWINAP run complete ($mode)." -ForegroundColor Cyan
-        Write-Host "Results: $($allResults.Count) | PASS: $(@($allResults | Where-Object Status -eq 'PASS').Count) | FAIL: $(@($allResults | Where-Object Status -eq 'FAIL').Count) | UNKNOWN: $(@($allResults | Where-Object Status -eq 'UNKNOWN').Count)"
-        Write-Host "HTML report: $reportPath"
-        Write-Host "Log file:    $logPath"
-        $allResults | Select-Object Status,Category,Check,Actual,Message | Format-Table -Wrap -AutoSize
-    } catch {
-        Write-Error "WINAP generated results but failed to write report/log: $($_.Exception.Message)"
+    $logName = if ($null -ne $cfg) { [string]$cfg.reporting.logFile } else { "WINAP-$runId.log" }
+    $reportName = if ($null -ne $cfg) { [string]$cfg.reporting.htmlReport } else { "WINAP-$runId.html" }
+
+    $completion = Complete-WINAPRun -OutputDirectory $outputDir -ReportName $reportName -LogName $logName -Results @($allResults.ToArray()) -Inventory $inventory -RunId $runId -Mode $mode -StartedAt $started
+    $finalResults = @($completion.Results)
+    $overallStatus = Get-WINAPOverallStatus -Results $finalResults
+    $counts = @{}
+    foreach ($status in @('PASS','FAIL','WARN','UNKNOWN','SKIPPED','INFO')) {
+        $counts[$status] = @($finalResults | Where-Object { $_.Status -eq $status }).Count
     }
-    return @($allResults.ToArray())
+
+    Write-Host "`nWINAP run completed: $overallStatus ($mode)." -ForegroundColor Cyan
+    Write-Host "Results: $($finalResults.Count) | PASS: $($counts.PASS) | FAIL: $($counts.FAIL) | WARN: $($counts.WARN) | UNKNOWN: $($counts.UNKNOWN) | SKIPPED: $($counts.SKIPPED)"
+    if ($completion.ReportWritten) { Write-Host "HTML report: $($completion.ReportPath)" }
+    else { Write-Host "HTML report: NOT GENERATED ($($completion.ReportPath))" -ForegroundColor Red }
+    if ($completion.LogWritten) { Write-Host "Log file:    $($completion.LogPath)" }
+    else { Write-Host "Log file:    NOT GENERATED ($($completion.LogPath))" -ForegroundColor Red }
+    $finalResults | Select-Object Status,Category,Check,Actual,Message | Format-Table -Wrap -AutoSize | Out-Host
+
+    if (-not $completion.ReportWritten -or -not $completion.LogWritten) {
+        Write-Error 'WINAP completed checks but one or more output files could not be generated. Review the Reporting FAIL results and console diagnostics.' -ErrorAction Continue
+    }
+    return $finalResults
 }
 
 Export-ModuleMember -Function Invoke-WINAP, Import-WINAPConfiguration, Invoke-WINAPAudit, Get-WINAPInventory, Test-WINAPEnvironment, Get-WINAPFeaturePlan, Invoke-WINAPSMB1Remediation, Write-WINAPHtmlReport

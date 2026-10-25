@@ -2,6 +2,15 @@
 
 All notable changes to WINAP are documented here. Entries describe actual changes and verified results; pending runtime checks are identified explicitly.
 
+## [0.5.0] - 2026-10-25
+
+### Phase 5 — Reporting and End-to-End Testing
+
+- Improved HTML reporting and execution logging with run metadata, inventory details, accurate status counts, and overall run status.
+- Added reporting error handling, HTML output escaping, and validation to prevent report/log filename collisions.
+- Expanded the built-in test harness to cover reporting, status accuracy, and output failure scenarios.
+- Verified 51 tests passed, 0 failed; Preview returned 11 results, with 6 PASS, 0 FAIL, 3 UNKNOWN, and 1 SKIPPED. The HTML report and execution log were generated successfully.
+
 ## [0.4.0] - 2026-10-25
 
 ### Phase 4 — Controlled Operations

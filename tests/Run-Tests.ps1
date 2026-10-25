@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param()
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -233,22 +233,78 @@ try {
     $invalid | Add-Member -MemberType NoteProperty -Name 'extraDangerousSetting' -Value $true
     $invalid | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $temp -Encoding UTF8
     Assert-Throws 'Rejects unknown top-level configuration keys' { Import-WINAPConfiguration -Path $temp }
+
+    $invalid = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+    $invalid.reporting.logFile = $invalid.reporting.htmlReport
+    $invalid | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $temp -Encoding UTF8
+    Assert-Throws 'Rejects colliding HTML report and execution log file names' { Import-WINAPConfiguration -Path $temp }
 } finally {
     Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
 }
 
+# Phase 5: logging, standalone report content, status accuracy, and output error paths.
 $testResults = @(
-    (New-Object PSObject -Property @{Timestamp='now';Category='Test';Check='HTML escape';Status='PASS';Message='<script>alert(1)</script>';Expected='';Actual=''})
+    (New-Object PSObject -Property @{Timestamp='now';Category='Test';Check='HTML escape';Status='PASS';Message='<script>alert(1)</script>';Expected='safe';Actual='observed'}),
+    (New-Object PSObject -Property @{Timestamp='now';Category='Test';Check='Simulated failure';Status='FAIL';Message='Simulated failure details';Expected='success';Actual='failure'}),
+    (New-Object PSObject -Property @{Timestamp='now';Category='Test';Check='Unknown state';Status='UNKNOWN';Message='State could not be verified';Expected='known';Actual='unknown'})
 )
-$reportPath = Join-Path $env:TEMP ('WINAP-test-' + [guid]::NewGuid().ToString('N') + '.html')
+$reportRoot = Join-Path $env:TEMP ('WINAP-phase5-' + [guid]::NewGuid().ToString('N'))
+$reportPath = Join-Path $reportRoot 'nested\WINAP-Report.html'
+$logPath = Join-Path $reportRoot 'nested\WINAP-Execution.log'
+$inventory = [PSCustomObject]@{ComputerName='TESTHOST';Domain='WORKGROUP';OperatingSystem='Test OS';OSVersion='10.0';OSBuild='1';PowerShellVersion='5.1';CDriveFreeGB=1;IsAdministrator=$false;LastBootTime='Unknown'}
+$runStart = (Get-Date).AddSeconds(-2)
 try {
-    $inventory = [PSCustomObject]@{ComputerName='TESTHOST';Domain='WORKGROUP';OperatingSystem='Test OS';OSBuild='1';PowerShellVersion='5.1';CDriveFreeGB=1;IsAdministrator=$false;LastBootTime='Unknown'}
-    Write-WINAPHtmlReport -Path $reportPath -Results $testResults -Inventory $inventory -RunId 'TEST' -Mode 'Audit'
+    Write-WINAPHtmlReport -Path $reportPath -Results $testResults -Inventory $inventory -RunId 'TEST-RUN' -Mode 'Audit' -LogPath $logPath -StartedAt $runStart
+    Assert-True 'HTML report creates a missing parent directory' (Test-Path -LiteralPath $reportPath -PathType Leaf)
     $html = Get-Content -LiteralPath $reportPath -Raw
-    Assert-True 'HTML report is generated' (Test-Path -LiteralPath $reportPath -PathType Leaf)
-    Assert-True 'HTML report escapes untrusted content' ($html -notmatch '<script>alert\(1\)</script>')
+    Assert-True 'HTML report escapes untrusted content' ($html -notmatch '<script>alert\(1\)</script>' -and $html -match '&lt;script&gt;')
+    Assert-True 'HTML report includes the correct total and status counts' ($html -match '<b>3</b>Total results' -and $html -match '<b>1</b>Pass' -and $html -match '<b>1</b>Fail' -and $html -match '<b>1</b>Unknown')
+    Assert-True 'HTML report marks a run with a FAIL result as FAILED' ($html -match 'Overall status:</b> <span class="overall">FAILED</span>')
+    Assert-True 'HTML report includes the log path and run ID' ($html -match 'WINAP-Execution\.log' -and $html -match 'TEST-RUN')
+    Assert-True 'HTML report is standalone with inline styling and no external assets' ($html -match '<style>' -and $html -notmatch 'href="https?://|src="https?://')
+
+    & $script:WinapModule {
+        param($path, $items, $runId, $mode, $startedAt, $inventoryData, $htmlPath)
+        Write-WINAPLog -Path $path -Results $items -RunId $runId -Mode $mode -StartedAt $startedAt -Inventory $inventoryData -ReportPath $htmlPath
+    } $logPath $testResults 'TEST-RUN' 'Audit' $runStart $inventory $reportPath
+    Assert-True 'Execution log creates a missing parent directory' (Test-Path -LiteralPath $logPath -PathType Leaf)
+    $log = Get-Content -LiteralPath $logPath -Raw
+    Assert-True 'Execution log records run metadata, inventory, and accurate overall status' ($log -match 'Run ID: TEST-RUN' -and $log -match 'Mode: Audit' -and $log -match 'ComputerName: TESTHOST' -and $log -match 'Overall status: FAILED')
+
+    $warningItems = @([PSCustomObject]@{Status='PASS'}, [PSCustomObject]@{Status='UNKNOWN'})
+    $warningStatus = & $script:WinapModule { param($items) Get-WINAPOverallStatus -Results $items } $warningItems
+    Assert-True 'Overall status reports unknown findings as warnings, not success' ($warningStatus -eq 'COMPLETED WITH WARNINGS')
+
+    # A report path occupied by a directory must produce a visible reporting failure while the log records it.
+    $reportBlocker = Join-Path $reportRoot 'report-blocker.html'
+    New-Item -ItemType Directory -Path $reportBlocker -Force | Out-Null
+    $reportFailureRun = & $script:WinapModule {
+        param($outputDirectory, $reportName, $results, $inventory, $startedAt)
+        Complete-WINAPRun -OutputDirectory $outputDirectory -ReportName $reportName -LogName 'report-failure.log' -Results $results -Inventory $inventory -RunId 'REPORT-FAILURE' -Mode 'Audit' -StartedAt $startedAt
+    } $reportRoot 'report-blocker.html' $testResults $inventory $runStart
+    $reportFailureLog = Get-Content -LiteralPath (Join-Path $reportRoot 'report-failure.log') -Raw
+    Assert-True 'HTML output failure is returned as FAIL and recorded in the log' ((@($reportFailureRun.Results | Where-Object { $_.Check -eq 'HTML report generation' -and $_.Status -eq 'FAIL' }).Count -eq 1) -and $reportFailureRun.LogWritten -and $reportFailureLog -match 'HTML report generation')
+
+    # A log path occupied by a directory must not be silently treated as success; refresh the report with the failure.
+    $logBlocker = Join-Path $reportRoot 'blocked.log'
+    New-Item -ItemType Directory -Path $logBlocker -Force | Out-Null
+    $logFailureRun = & $script:WinapModule {
+        param($outputDirectory, $results, $inventory, $startedAt)
+        Complete-WINAPRun -OutputDirectory $outputDirectory -ReportName 'log-failure-report.html' -LogName 'blocked.log' -Results $results -Inventory $inventory -RunId 'LOG-FAILURE' -Mode 'Audit' -StartedAt $startedAt
+    } $reportRoot $testResults $inventory $runStart
+    $logFailureHtml = Get-Content -LiteralPath (Join-Path $reportRoot 'log-failure-report.html') -Raw
+    Assert-True 'Log output failure is returned as FAIL and reflected in the report' ((@($logFailureRun.Results | Where-Object { $_.Check -eq 'Execution log generation' -and $_.Status -eq 'FAIL' }).Count -eq 1) -and (-not $logFailureRun.LogWritten) -and $logFailureRun.ReportWritten -and $logFailureHtml -match 'Execution log generation')
+
+    # An output directory path that is a file must fail visibly instead of throwing away the run results.
+    $outputBlocker = Join-Path $reportRoot 'output-is-a-file'
+    Set-Content -LiteralPath $outputBlocker -Value 'blocker' -Encoding UTF8
+    $outputFailureRun = & $script:WinapModule {
+        param($outputDirectory, $results, $inventory, $startedAt)
+        Complete-WINAPRun -OutputDirectory $outputDirectory -ReportName 'report.html' -LogName 'run.log' -Results $results -Inventory $inventory -RunId 'OUTPUT-FAILURE' -Mode 'Audit' -StartedAt $startedAt
+    } $outputBlocker $testResults $inventory $runStart
+    Assert-True 'Invalid output directory returns a Reporting FAIL result without claiming files were written' ((@($outputFailureRun.Results | Where-Object { $_.Check -eq 'Output directory' -and $_.Status -eq 'FAIL' }).Count -eq 1) -and (-not $outputFailureRun.ReportWritten) -and (-not $outputFailureRun.LogWritten))
 } finally {
-    Remove-Item -LiteralPath $reportPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $reportRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host "`nTest summary: $script:Passed passed; $script:Failed failed." -ForegroundColor Cyan
